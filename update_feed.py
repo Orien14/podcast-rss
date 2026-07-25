@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 import html
-import re
 import sys
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 import requests
-from bs4 import BeautifulSoup
 
 SOURCE_URLS = [
     "https://rss.lizhi.fm/rss/3528895.xml",
     "http://rss.lizhi.fm/rss/3528895.xml",
 ]
 OUT = Path("heishaguihua.xml")
+SELF_URL = "https://raw.githubusercontent.com/Orien14/podcast-rss/main/heishaguihua.xml"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1",
     "Accept": "application/rss+xml, application/xml, text/xml, */*",
 }
+
+ITUNES = "http://www.itunes.com/dtds/podcast-1.0.dtd"
+ATOM = "http://www.w3.org/2005/Atom"
+ET.register_namespace("itunes", ITUNES)
+ET.register_namespace("atom", ATOM)
 
 
 def fetch_source() -> str:
@@ -32,50 +37,91 @@ def fetch_source() -> str:
     raise RuntimeError("Unable to fetch source RSS: " + " | ".join(errors))
 
 
-def clean_description(text: str) -> str:
-    # Remove Lizhi-specific markup while preserving readable text.
-    soup = BeautifulSoup(text or "", "html.parser")
-    return soup.get_text("\n", strip=True)
+def text_of(node, tag, default=""):
+    child = node.find(tag)
+    return (child.text or "").strip() if child is not None and child.text else default
 
 
-def transform(xml_text: str) -> str:
-    # Normalize http media/feed URLs to https where supported.
-    xml_text = xml_text.replace("http://cdn.lizhi.fm/", "https://cdn.lizhi.fm/")
-    xml_text = xml_text.replace("http://imagev2.xmcdn.com/", "https://imagev2.xmcdn.com/")
+def build_minimal_feed(xml_text: str) -> bytes:
+    src = ET.fromstring(xml_text)
+    src_channel = src.find("channel")
+    if src_channel is None:
+        raise RuntimeError("Source RSS has no channel")
 
-    # Remove self-referential atom:link entries that point back to the problematic source server.
-    xml_text = re.sub(r"\s*<atom:link\b[^>]*/>\s*", "\n", xml_text, flags=re.I)
+    rss = ET.Element("rss", {"version": "2.0"})
+    channel = ET.SubElement(rss, "channel")
 
-    # Strip Lizhi custom <myfont> tags but keep their content.
-    xml_text = re.sub(r"</?myfont\b[^>]*>", "", xml_text, flags=re.I)
+    title = text_of(src_channel, "title", "黑鲨诡话")
+    description = text_of(src_channel, "description", "黑鲨诡话播客")
 
-    # Make guid non-permalink so clients do not try to resolve legacy HTTP guid URLs.
-    xml_text = re.sub(
-        r"<guid(?:\s+isPermaLink=['\"](?:true|false)['\"])?>(.*?)</guid>",
-        lambda m: f'<guid isPermaLink="false">{html.escape(html.unescape(m.group(1)), quote=False)}</guid>',
-        xml_text,
-        flags=re.I | re.S,
-    )
+    ET.SubElement(channel, "title").text = title
+    ET.SubElement(channel, "link").text = "https://www.lizhi.fm/"
+    ET.SubElement(channel, "language").text = "zh-CN"
+    ET.SubElement(channel, "description").text = description
+    ET.SubElement(channel, f"{{{ITUNES}}}author").text = title
+    ET.SubElement(channel, f"{{{ITUNES}}}summary").text = description
+    ET.SubElement(channel, f"{{{ITUNES}}}explicit").text = "yes"
+    ET.SubElement(channel, f"{{{ITUNES}}}category", {"text": "Society & Culture"})
+    ET.SubElement(channel, f"{{{ATOM}}}link", {
+        "href": SELF_URL,
+        "rel": "self",
+        "type": "application/rss+xml",
+    })
 
-    # Normalize any remaining legacy Lizhi audio URLs.
-    xml_text = xml_text.replace("http://cdn.lizhi.fm/audio/", "https://cdn.lizhi.fm/audio/")
+    image = src_channel.find(f"{{{ITUNES}}}image")
+    if image is not None and image.attrib.get("href"):
+        ET.SubElement(channel, f"{{{ITUNES}}}image", {"href": image.attrib["href"].replace("http://", "https://")})
 
-    # Ensure UTF-8 declaration.
-    xml_text = re.sub(
-        r"^<\?xml[^>]*\?>",
-        '<?xml version="1.0" encoding="UTF-8"?>',
-        xml_text,
-        count=1,
-        flags=re.I,
-    )
-    return xml_text
+    for src_item in src_channel.findall("item"):
+        enclosure = src_item.find("enclosure")
+        if enclosure is None or not enclosure.attrib.get("url"):
+            continue
+
+        item = ET.SubElement(channel, "item")
+        item_title = text_of(src_item, "title", "黑鲨诡话")
+        ET.SubElement(item, "title").text = item_title
+
+        link = text_of(src_item, "link")
+        if link:
+            ET.SubElement(item, "link").text = link.replace("http://", "https://")
+
+        ET.SubElement(item, "description").text = item_title
+        ET.SubElement(item, f"{{{ITUNES}}}author").text = title
+        ET.SubElement(item, f"{{{ITUNES}}}explicit").text = "yes"
+
+        audio_url = enclosure.attrib["url"].replace("http://", "https://")
+        length = enclosure.attrib.get("length", "0")
+        mime = enclosure.attrib.get("type", "audio/mpeg") or "audio/mpeg"
+        ET.SubElement(item, "enclosure", {
+            "url": audio_url,
+            "length": length,
+            "type": mime,
+        })
+        guid = ET.SubElement(item, "guid", {"isPermaLink": "false"})
+        guid.text = audio_url
+
+        pubdate = text_of(src_item, "pubDate")
+        if pubdate:
+            ET.SubElement(item, "pubDate").text = pubdate
+
+        duration = text_of(src_item, f"{{{ITUNES}}}duration")
+        if duration:
+            ET.SubElement(item, f"{{{ITUNES}}}duration").text = duration
+
+        ep_image = src_item.find(f"{{{ITUNES}}}image")
+        if ep_image is not None and ep_image.attrib.get("href"):
+            ET.SubElement(item, f"{{{ITUNES}}}image", {"href": ep_image.attrib["href"].replace("http://", "https://")})
+
+    tree = ET.ElementTree(rss)
+    ET.indent(tree, space="  ")
+    return ET.tostring(rss, encoding="utf-8", xml_declaration=True)
 
 
 def main() -> int:
     raw = fetch_source()
-    fixed = transform(raw)
-    OUT.write_text(fixed, encoding="utf-8")
-    print(f"Wrote {OUT} ({len(fixed)} chars)")
+    fixed = build_minimal_feed(raw)
+    OUT.write_bytes(fixed)
+    print(f"Wrote {OUT} ({len(fixed)} bytes)")
     return 0
 
 
